@@ -1,55 +1,92 @@
 from pyspark.sql import SparkSession
 import boto3
 import json
-
-def read_annotations(file_path):
-    """
-    Reads a JSON file from S3 and returns its content as a dictionary.
-    :param file_path: Path to the JSON file in S3.
-    :return: Parsed JSON data.
-    """
-    s3 = boto3.client('s3')
-    bucket, key = file_path.replace("s3://", "").split("/", 1)
-    obj = s3.get_object(Bucket=bucket, Key=key)
-    return json.loads(obj['Body'].read().decode('utf-8'))
-
-def preprocess_annotations(file_path, dataset_type, processed_output):
-    """
-    Preprocesses COCO annotations and saves them as Parquet files.
-    :param file_path: Path to the JSON file in S3.
-    :param dataset_type: The type of dataset (e.g., "train", "val").
-    :param processed_output: Path to save the processed files in S3.
-    """
-    annotations = read_annotations(file_path)
-    images = annotations["images"]
-    annotations_data = annotations["annotations"]
-
-    # Flatten and prepare RDDs
-    image_rdd = spark.sparkContext.parallelize(images).map(lambda x: (x["id"], x["file_name"], x["height"], x["width"]))
-    annotations_rdd = spark.sparkContext.parallelize(annotations_data).map(lambda x: (x["image_id"], x["category_id"], x["bbox"], x["area"], x["iscrowd"]))
-
-    # Create DataFrames
-    images_df = image_rdd.toDF(["image_id", "file_name", "height", "width"])
-    annotations_df = annotations_rdd.toDF(["image_id", "category_id", "bbox", "area", "iscrowd"])
-
-    # Join and save as Parquet
-    joined_df = images_df.join(annotations_df, on="image_id", how="inner")
-    output_path = f"{processed_output}{dataset_type}_annotations.parquet"
-    joined_df.write.parquet(output_path, mode="overwrite")
-    print(f"Preprocessed {dataset_type} annotations saved to {output_path}.")
+import cv2
+import numpy as np
+from io import BytesIO
+from PIL import Image
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # Initialize Spark session
-spark = SparkSession.builder.appName("COCO_Preprocessing").getOrCreate()
+spark = SparkSession.builder.appName("COCO Data Preprocessing").getOrCreate()
 
-# Define S3 paths
-s3_bucket = "images-data-coco"
-train_annotations = f"s3://{s3_bucket}/extracted/annotations_trainval2017/instances_train2017.json"
-val_annotations = f"s3://{s3_bucket}/extracted/annotations_trainval2017/instances_val2017.json"
-processed_output = f"s3://{s3_bucket}/processed/"
+# Define S3 bucket details
+S3_BUCKET = "images-data-coco"
+TRAIN_IMAGES_PREFIX = "extracted/train2017/"
+VAL_IMAGES_PREFIX = "extracted/val2017/"
+TEST_IMAGES_PREFIX = "extracted/test2017/"
+ANNOTATIONS_PATH = "extracted/annotations_trainval2017/instances_train2017.json"
+OUTPUT_PREFIX = "processed-images/"
 
-# Process train and validation annotations
-preprocess_annotations(train_annotations, "train", processed_output)
-preprocess_annotations(val_annotations, "val", processed_output)
+# Initialize S3 client
+s3_client = boto3.client('s3')
 
-# Stop Spark session
-spark.stop()
+def load_annotations():
+    """Load COCO annotations from S3."""
+    response = s3_client.get_object(Bucket=S3_BUCKET, Key=ANNOTATIONS_PATH)
+    return json.loads(response['Body'].read().decode('utf-8'))
+
+def read_image_from_s3(image_key):
+    """Read image from S3."""
+    response = s3_client.get_object(Bucket=S3_BUCKET, Key=image_key)
+    image_data = response['Body'].read()
+    image = Image.open(BytesIO(image_data))
+    return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+
+def preprocess_image(image_key):
+    """Resize and grayscale image, then upload to S3."""
+    try:
+        img = read_image_from_s3(image_key)
+        resized = cv2.resize(img, (512, 512))
+        processed_img = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+        
+        # Convert processed image to bytes
+        _, buffer = cv2.imencode(".jpg", processed_img)
+        s3_client.put_object(Bucket=S3_BUCKET, Key=OUTPUT_PREFIX + image_key.split("/")[-1], Body=buffer.tobytes())
+        
+        return image_key, processed_img.shape
+    except Exception as e:
+        return image_key, str(e)
+
+def analyze_class_distribution(annotations):
+    """Analyze and plot class distribution from COCO annotations."""
+    category_counts = {}
+    for ann in annotations['annotations']:
+        category_id = ann['category_id']
+        category_counts[category_id] = category_counts.get(category_id, 0) + 1
+
+    # Plot distribution
+    plt.figure(figsize=(12, 6))
+    sns.barplot(x=list(category_counts.keys()), y=list(category_counts.values()))
+    plt.title("COCO Class Distribution")
+    plt.xlabel("Class ID")
+    plt.ylabel("Frequency")
+    
+    # Save figure as bytes and upload to S3
+    buf = BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    s3_client.put_object(Bucket=S3_BUCKET, Key="eda/class_distribution.png", Body=buf)
+
+def main():
+    """Main function to execute preprocessing."""
+    annotations = load_annotations()
+    analyze_class_distribution(annotations)
+
+    # Get all image keys
+    response = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=TRAIN_IMAGES_PREFIX)
+    image_keys = [obj['Key'] for obj in response.get('Contents', []) if obj['Key'].endswith('.jpg')]
+
+    # Process images using Spark
+    images_rdd = spark.sparkContext.parallelize(image_keys)
+    results = images_rdd.map(preprocess_image).collect()
+
+    # Print sample results
+    for res in results[:10]:
+        print(res)
+
+    print("Preprocessing completed and saved to S3.")
+
+if __name__ == "__main__":
+    main()
